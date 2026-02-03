@@ -33,3 +33,4 @@ R, tidyverse, MASS, caret, class, pROC
 - donor_models.R – Script version of models  
 
 ## Data
+Dataset provided as part of university coursework and is not included due to licensing restrictions.
