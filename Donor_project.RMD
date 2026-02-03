@@ -1,0 +1,496 @@
+---
+title: "Predicting Donor Response to a Campaign"
+author: "Kyle Morgan"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output: word_document
+---
+
+
+
+```{r}
+library(tidyverse)
+library(janitor)
+library(pdftools)
+
+# 1) Read PDF text
+getwd()
+setwd("C:/Users/Kyle/Documents/mercer/Donor project")
+pdf_path <- "donors.csv (1).pdf"
+txt <- pdftools::pdf_text(pdf_path)
+
+# 2) Combine into one big character string
+txt_all <- paste(txt, collapse = "\n")
+
+# 3) Write to a temporary text file (makes parsing easier)
+writeLines(txt_all, "donors_extracted.txt")
+
+# 4) Read lines and clean obvious junk/empty lines
+lines <- readLines("donors_extracted.txt", warn = FALSE)
+lines <- lines[lines != ""]
+lines <- trimws(lines)
+
+# 5) Find header line (the line containing respondedMailing / responded_mailing)
+# We'll search for the response column name pattern
+header_idx <- grep("responded", tolower(lines))[1]
+header_idx
+lines[header_idx]
+
+
+
+
+```
+
+## ext chunk: Parse table starting at the header
+
+
+```{r}
+# 6) Keep everything from the header line onward
+data_lines <- lines[header_idx:length(lines)]
+
+# 7) Convert into a single text block for read.table
+data_text <- paste(data_lines, collapse = "\n")
+
+# 8) Read as whitespace-delimited table
+donors <- read.table(
+  text = data_text,
+  header = TRUE,
+  fill = TRUE,
+  quote = "",
+  stringsAsFactors = FALSE,
+  comment.char = ""
+) %>% 
+  clean_names()
+
+glimpse(donors)
+head(donors, 3)
+
+```
+## ext chunk: Validate target + key columns
+
+
+```{r}
+names(donors)
+
+# Target check
+table(donors$responded_mailing, useNA = "ifany")
+prop.table(table(donors$responded_mailing))
+
+# Quick sanity check of some columns
+summary(donors$age)
+summary(donors$total_giving_amount)
+table(donors$gender, useNA = "ifany")
+
+
+```
+
+# If something looks off (common with PDF-to-table)
+If `glimpse(donors)` shows a weird number of columns or a single giant column, tell me what you see — but we can usually fix it by changing the delimiter strategy.
+
+---
+
+# once `donors` looks correct, here is the rest (prep + models)
+
+After the validation chunk, paste the following sections in order.
+
+## 1) Data prep (types + homeowner + imputation)
+
+
+```{r}
+library(caret)
+library(MASS)
+library(class)
+library(pROC)
+library(forcats)
+
+donors_clean <- donors %>%
+  mutate(
+    responded_mailing = as.character(responded_mailing),
+    responded_mailing = ifelse(tolower(responded_mailing) %in% c("true","t","1","yes"), "TRUE", "FALSE"),
+    responded_mailing = factor(responded_mailing, levels = c("FALSE","TRUE")),
+
+    state = factor(state),
+    urbanicity = factor(urbanicity),
+    socio_economic_status = factor(socio_economic_status),
+    gender = factor(gender),
+
+    # is_homeowner: TRUE or NA only -> Homeowner/Unknown
+    is_homeowner = case_when(
+      is_homeowner == TRUE ~ "Homeowner",
+      is.na(is_homeowner) ~ "Unknown",
+      TRUE ~ "Unknown"
+    ),
+    is_homeowner = factor(is_homeowner),
+
+    # Ensure logical flags are logical (in case they import as text)
+    in_house_donor = as.logical(in_house_donor),
+    planned_giving_donor = as.logical(planned_giving_donor),
+    sweepstakes_donor = as.logical(sweepstakes_donor),
+    p3donor = as.logical(p3donor)
+  )
+
+# Median impute numeric, "Unknown" for factors
+median_impute <- function(x) ifelse(is.na(x), median(x, na.rm = TRUE), x)
+
+donors_clean <- donors_clean %>%
+  mutate(across(where(is.numeric), median_impute)) %>%
+  mutate(across(where(is.factor), ~forcats::fct_explicit_na(.x, na_level = "Unknown")))
+
+glimpse(donors_clean)
+
+```
+## 2) Train/test split
+
+
+```{r}
+
+set.seed(123)
+idx <- createDataPartition(donors_clean$responded_mailing, p = 0.70, list = FALSE)
+train <- donors_clean[idx, ]
+test  <- donors_clean[-idx, ]
+
+# ---- BULLETPROOF FIX: handle unseen factor levels in test (like state = "AS") ----
+factor_cols <- names(train)[sapply(train, is.factor)]
+
+for (col in factor_cols) {
+
+  # Ensure train has an "Unknown" level available
+  if (!("Unknown" %in% levels(train[[col]]))) {
+    train[[col]] <- forcats::fct_expand(train[[col]], "Unknown")
+  }
+
+  # Convert test to character, replace unseen levels with "Unknown", then refactor
+  test_chr <- as.character(test[[col]])
+  test_chr[is.na(test_chr)] <- "Unknown"
+
+  unseen <- !(test_chr %in% levels(train[[col]]))
+  test_chr[unseen] <- "Unknown"
+
+  test[[col]] <- factor(test_chr, levels = levels(train[[col]]))
+}
+
+# quick check: should NOT include "AS" anymore
+unique(as.character(test$state))[1:30]
+
+```
+```{r}
+# --- HARD FIX FOR STATE NEW LEVELS (e.g., "AS") ---
+
+# Make sure state is factor in both
+train$state <- factor(train$state)
+test$state  <- as.character(test$state)
+
+# Add "Unknown" level to train$state if missing
+if (!("Unknown" %in% levels(train$state))) {
+  train$state <- forcats::fct_expand(train$state, "Unknown")
+}
+
+# Replace any unseen test states with "Unknown"
+test$state[is.na(test$state)] <- "Unknown"
+test$state[!(test$state %in% levels(train$state))] <- "Unknown"
+
+# Re-factor test$state to exactly match train levels
+test$state <- factor(test$state, levels = levels(train$state))
+
+# Sanity check: if "AS" still exists, STOP so we know the fix chunk isn't running
+if ("AS" %in% unique(as.character(test$state))) {
+  stop("STATE FIX FAILED: test$state still contains AS. You likely have another train/test split later in the file.")
+}
+
+# Quick debug print
+cat("State levels aligned. Any AS in test? ", any(as.character(test$state) == "AS"), "\n")
+
+```
+
+
+
+
+## 3) Logistic Regression
+
+
+
+
+
+```{r}
+
+# ----- LOGISTIC REGRESSION (BULLETPROOF LEVEL HANDLING) -----
+
+# 1) Ensure "Unknown" exists as a training level BEFORE fitting
+if (!("Unknown" %in% levels(train$state))) {
+  train$state <- forcats::fct_expand(train$state, "Unknown")
+}
+
+# (Optional but safe) ensure Unknown exists for other factor columns too
+factor_cols <- names(train)[sapply(train, is.factor)]
+for (col in factor_cols) {
+  if (!("Unknown" %in% levels(train[[col]]))) {
+    train[[col]] <- forcats::fct_expand(train[[col]], "Unknown")
+  }
+}
+
+# 2) Fit the model NOW (after expanding levels)
+log_model <- glm(responded_mailing ~ ., data = train, family = binomial)
+summary(log_model)
+
+# 3) Force test factors to match EXACT levels the model expects
+for (col in names(log_model$xlevels)) {
+  # replace unseen levels with "Unknown"
+  test_chr <- as.character(test[[col]])
+  test_chr[is.na(test_chr)] <- "Unknown"
+  test_chr[!(test_chr %in% log_model$xlevels[[col]])] <- "Unknown"
+  test[[col]] <- factor(test_chr, levels = log_model$xlevels[[col]])
+}
+
+# 4) Predict + evaluate
+log_prob <- predict(log_model, newdata = test, type = "response")
+log_pred <- factor(ifelse(log_prob >= 0.5, "TRUE", "FALSE"),
+                   levels = c("FALSE","TRUE"))
+
+confusionMatrix(log_pred, test$responded_mailing, positive = "TRUE")
+
+roc_log <- roc(test$responded_mailing, log_prob, levels = c("FALSE","TRUE"))
+plot(roc_log, main = "ROC - Logistic Regression")
+auc(roc_log)
+
+exp(coef(log_model))
+
+
+```
+## 4) LDA
+
+
+```{r}
+
+# ----- LDA (row-safe: ensure x and y have same rows) -----
+
+# Keep only complete rows for the predictors used by model.matrix
+# (Prevents model.matrix from silently dropping rows and breaking lengths)
+train_cc <- train %>% drop_na()
+test_cc  <- test %>% drop_na()
+
+# Design matrices
+x_train <- model.matrix(responded_mailing ~ ., data = train_cc)[, -1]
+x_test  <- model.matrix(responded_mailing ~ ., data = test_cc)[, -1]
+
+y_train <- train_cc$responded_mailing
+y_test  <- test_cc$responded_mailing
+
+# Remove near-zero variance predictors (TRAIN only)
+nzv <- caret::nearZeroVar(x_train)
+
+if (length(nzv) > 0) {
+  x_train2 <- x_train[, -nzv, drop = FALSE]
+  x_test2  <- x_test[,  -nzv, drop = FALSE]
+} else {
+  x_train2 <- x_train
+  x_test2  <- x_test
+}
+
+# Fit LDA
+lda_model <- MASS::lda(x = x_train2, grouping = y_train)
+lda_pred  <- predict(lda_model, newdata = x_test2)
+
+# Sanity check (should match)
+length(lda_pred$class)
+length(y_test)
+
+confusionMatrix(lda_pred$class, y_test, positive = "TRUE")
+
+roc_lda <- pROC::roc(y_test, lda_pred$posterior[, "TRUE"], levels = c("FALSE","TRUE"))
+plot(roc_lda, main = "ROC - LDA")
+auc(roc_lda)
+
+```
+
+
+
+## 5) QDA
+
+
+```{r}
+
+
+# ----- QDA (robust: column-aligned + auto-reduce + graceful fallback) -----
+
+train_cc <- train %>% drop_na()
+test_cc  <- test %>% drop_na()
+
+x_train <- model.matrix(responded_mailing ~ ., data = train_cc)[, -1]
+x_test  <- model.matrix(responded_mailing ~ ., data = test_cc)[, -1]
+y_train <- train_cc$responded_mailing
+y_test  <- test_cc$responded_mailing
+
+# 1) Align columns: force x_test to match x_train
+missing_cols <- setdiff(colnames(x_train), colnames(x_test))
+if (length(missing_cols) > 0) {
+  x_test <- cbind(
+    x_test,
+    matrix(0, nrow = nrow(x_test), ncol = length(missing_cols),
+           dimnames = list(NULL, missing_cols))
+  )
+}
+extra_cols <- setdiff(colnames(x_test), colnames(x_train))
+if (length(extra_cols) > 0) {
+  x_test <- x_test[, setdiff(colnames(x_test), extra_cols), drop = FALSE]
+}
+x_test <- x_test[, colnames(x_train), drop = FALSE]
+
+# 2) Remove near-zero variance predictors (based on TRAIN)
+nzv <- caret::nearZeroVar(x_train)
+if (length(nzv) > 0) {
+  x_train <- x_train[, -nzv, drop = FALSE]
+  x_test  <- x_test[,  -nzv, drop = FALSE]
+}
+
+# 3) Check class sizes
+counts <- table(y_train)
+counts
+min_class <- min(counts)
+
+# Default placeholders so the report still knits even if QDA can't run
+qda_worked <- FALSE
+qda_acc <- NA
+qda_auc <- NA
+qda_pred <- list(class = factor(rep(NA, length(y_test)), levels = levels(y_test)),
+                 posterior = matrix(NA, nrow = length(y_test), ncol = 2,
+                                    dimnames = list(NULL, c("FALSE","TRUE"))))
+
+if (min_class < 3) {
+  cat("⚠️ QDA skipped: minority class in TRAIN is too small for QDA (min_class < 3).\n")
+} else {
+
+  # Rank predictors by variance (TRAIN) and try decreasing P until fit succeeds
+  vars <- apply(x_train, 2, var)
+  ranked_cols <- names(sort(vars, decreasing = TRUE))
+
+  P <- min(20, min_class - 1, length(ranked_cols))
+  cat("Trying QDA with up to P =", P, "predictors (min class =", min_class, ")\n")
+
+  while (P >= 1 && !qda_worked) {
+    top_cols <- ranked_cols[1:P]
+
+    x_train2 <- x_train[, top_cols, drop = FALSE]
+    x_test2  <- x_test[,  top_cols, drop = FALSE]
+
+    try_fit <- try(MASS::qda(x = x_train2, grouping = y_train), silent = TRUE)
+
+    if (!inherits(try_fit, "try-error")) {
+      qda_model <- try_fit
+      qda_pred <- predict(qda_model, newdata = x_test2)
+      qda_worked <- TRUE
+
+      # Evaluate
+      cm <- confusionMatrix(qda_pred$class, y_test, positive = "TRUE")
+      print(cm)
+
+      roc_qda <- pROC::roc(y_test, qda_pred$posterior[, "TRUE"], levels = c("FALSE","TRUE"))
+      plot(roc_qda, main = paste0("ROC - QDA (P=", P, ")"))
+      qda_auc <- as.numeric(pROC::auc(roc_qda))
+      qda_acc <- as.numeric(cm$overall["Accuracy"])
+
+      cat("✅ QDA fit succeeded with P =", P, " | Accuracy =", round(qda_acc, 4),
+          " | AUC =", round(qda_auc, 4), "\n")
+
+    } else {
+      P <- P - 1
+    }
+  }
+
+  if (!qda_worked) {
+    cat("⚠️ QDA could not be fit even after reducing predictors down to 1. Skipping QDA.\n")
+  }
+}
+
+
+```
+## 6) KNN (dummy encode + scale + choose k)
+
+
+```{r}
+# ----- FAST KNN (drop high-cardinality state + reduce predictors) -----
+
+# 1) Drop state (it explodes into many dummy columns and slows KNN massively)
+train_knn <- train %>% dplyr::select(-state) %>% drop_na()
+test_knn  <- test %>% dplyr::select(-state) %>% drop_na()
+
+# 2) Dummy encode
+x_train <- model.matrix(responded_mailing ~ ., data = train_knn)[, -1]
+x_test  <- model.matrix(responded_mailing ~ ., data = test_knn)[, -1]
+
+y_train <- train_knn$responded_mailing
+y_test  <- test_knn$responded_mailing
+
+# 3) Align columns (make test match train)
+missing_cols <- setdiff(colnames(x_train), colnames(x_test))
+if (length(missing_cols) > 0) {
+  x_test <- cbind(
+    x_test,
+    matrix(0, nrow = nrow(x_test), ncol = length(missing_cols),
+           dimnames = list(NULL, missing_cols))
+  )
+}
+extra_cols <- setdiff(colnames(x_test), colnames(x_train))
+if (length(extra_cols) > 0) {
+  x_test <- x_test[, setdiff(colnames(x_test), extra_cols), drop = FALSE]
+}
+x_test <- x_test[, colnames(x_train), drop = FALSE]
+
+# 4) Reduce dimensionality: keep top P predictors by variance (TRAIN)
+P <- 30
+if (ncol(x_train) > P) {
+  vars <- apply(x_train, 2, var)
+  top_cols <- names(sort(vars, decreasing = TRUE))[1:P]
+  x_train <- x_train[, top_cols, drop = FALSE]
+  x_test  <- x_test[,  top_cols, drop = FALSE]
+}
+
+# 5) Scale using TRAIN stats
+train_means <- apply(x_train, 2, mean)
+train_sds   <- apply(x_train, 2, sd)
+train_sds[train_sds == 0] <- 1
+
+x_train_s <- scale(x_train, center = train_means, scale = train_sds)
+x_test_s  <- scale(x_test,  center = train_means, scale = train_sds)
+
+# 6) Try only a few k values (much faster)
+set.seed(123)
+k_vals <- c(5, 15, 25)
+knn_acc <- sapply(k_vals, function(k) {
+  pred <- class::knn(train = x_train_s, test = x_test_s, cl = y_train, k = k)
+  mean(pred == y_test)
+})
+
+knn_table <- data.frame(k = k_vals, accuracy = knn_acc)
+knn_table
+
+best_k <- knn_table$k[which.max(knn_table$accuracy)]
+best_k
+
+knn_pred <- class::knn(train = x_train_s, test = x_test_s, cl = y_train, k = best_k)
+caret::confusionMatrix(knn_pred, y_test, positive = "TRUE")
+
+```
+## 7) Compare models
+
+
+```{r}
+acc <- function(actual, pred) {
+  mean(as.character(actual) == as.character(pred), na.rm = TRUE)
+}
+
+# Safe QDA accuracy (only if qda_pred exists AND has non-missing classes)
+qda_acc <- NA
+if (exists("qda_pred") && !all(is.na(qda_pred$class))) {
+  qda_acc <- acc(y_test, qda_pred$class)
+}
+
+results <- tibble(
+  Model = c("Logistic Regression", "LDA", "QDA", paste0("KNN (k=", best_k, ")")),
+  Test_Accuracy = c(
+    acc(test$responded_mailing, log_pred),
+    acc(y_test, lda_pred$class),
+    qda_acc,
+    acc(y_test, knn_pred)
+  )
+)
+
+print(results %>% arrange(desc(Test_Accuracy)))
